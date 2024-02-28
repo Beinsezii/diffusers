@@ -26,6 +26,7 @@ from ..utils.torch_utils import maybe_allow_in_graph
 from .lora import LoRACompatibleLinear, LoRALinearLayer
 from .sub_quadratic_attention import efficient_dot_product_attention as attn_subquad
 
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 if is_xformers_available():

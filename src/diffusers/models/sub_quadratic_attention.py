@@ -10,12 +10,12 @@
 #   https://arxiv.org/abs/2112.05682v2
 
 import math
-import torch
-from ..utils.dynamic_slice import dynamic_slice
 from functools import partial
+from typing import List, NamedTuple, Optional, Protocol
+
+import torch
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
-from typing import Optional, NamedTuple, Protocol, List
 
 
 class AttnChunk(NamedTuple):
@@ -42,6 +42,15 @@ class ComputeQueryChunkAttn(Protocol):
         value: Tensor,
     ) -> Tensor:
         ...
+
+
+def _dynamic_slice(
+    x: Tensor,
+    starts: List[int],
+    sizes: List[int],
+) -> Tensor:
+    slicing = [slice(start, start + size) for start, size in zip(starts, sizes)]
+    return x[slicing]
 
 
 def _summarize_chunk(
@@ -76,8 +85,8 @@ def _query_chunk_attention(
     _, _, v_channels_per_head = value.shape
 
     def chunk_scanner(chunk_idx: int) -> AttnChunk:
-        key_chunk = dynamic_slice(key_t, (0, 0, chunk_idx), (batch_x_heads, k_channels_per_head, kv_chunk_size))
-        value_chunk = dynamic_slice(value, (0, chunk_idx, 0), (batch_x_heads, kv_chunk_size, v_channels_per_head))
+        key_chunk = _dynamic_slice(key_t, (0, 0, chunk_idx), (batch_x_heads, k_channels_per_head, kv_chunk_size))
+        value_chunk = _dynamic_slice(value, (0, chunk_idx, 0), (batch_x_heads, kv_chunk_size, v_channels_per_head))
         return summarize_chunk(query, key_chunk, value_chunk)
 
     chunks: List[AttnChunk] = [chunk_scanner(chunk) for chunk in torch.arange(0, k_tokens, kv_chunk_size)]
@@ -154,7 +163,7 @@ def efficient_dot_product_attention(
         kv_chunk_size = max(kv_chunk_size, kv_chunk_size_min)
 
     def get_query_chunk(chunk_idx: int) -> Tensor:
-        return dynamic_slice(
+        return _dynamic_slice(
             query, (0, chunk_idx, 0), (batch_x_heads, min(query_chunk_size, q_tokens), q_channels_per_head)
         )
 
