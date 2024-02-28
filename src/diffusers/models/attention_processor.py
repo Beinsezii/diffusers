@@ -2412,14 +2412,12 @@ class SubQuadraticCrossAttnProcessor:
     query_chunk_size: int
     kv_chunk_size: Optional[int]
     kv_chunk_size_min: Optional[int]
-    chunk_threshold_bytes: Optional[int]
 
     def __init__(
         self,
         query_chunk_size=1024,
         kv_chunk_size: Optional[int] = None,
         kv_chunk_size_min: Optional[int] = None,
-        chunk_threshold_bytes: Optional[int] = None,
     ):
         r"""
         Args:
@@ -2431,71 +2429,87 @@ class SubQuadraticCrossAttnProcessor:
         self.query_chunk_size = query_chunk_size
         self.kv_chunk_size = kv_chunk_size
         self.kv_chunk_size_min = kv_chunk_size_min
-        self.chunk_threshold_bytes = chunk_threshold_bytes
 
     def __call__(
         self,
         attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ):
-        encoder_hidden_states = hidden_states if encoder_hidden_states is None else encoder_hidden_states
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        temb: Optional[torch.FloatTensor] = None,
+        scale: float = 1.0,
+    ) -> torch.FloatTensor:
+        residual = hidden_states
 
-        assert attention_mask is None, "attention-mask not currently implemented for SubQuadraticCrossAttnProcessor."
-        # I don't know what test case can be used to determine whether softmax is computed at sufficient bit-width,
-        # but sub-quadratic attention has a pretty bespoke softmax (defers computation of the denominator) so this needs some thought.
-        assert (
-            not attn.upcast_softmax or torch.finfo(hidden_states.dtype).bits >= 32
-        ), "upcast_softmax was requested, but is not implemented"
+        args = () if USE_PEFT_BACKEND else (scale,)
 
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(encoder_hidden_states)
-        value = attn.to_v(encoder_hidden_states)
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
 
-        query = query.unflatten(-1, (attn.heads, -1)).transpose(1, 2).flatten(end_dim=1)
-        key_t = key.transpose(1, 2).unflatten(1, (attn.heads, -1)).flatten(end_dim=1)
-        del key
-        value = value.unflatten(-1, (attn.heads, -1)).transpose(1, 2).flatten(end_dim=1)
+        input_ndim = hidden_states.ndim
 
-        dtype = query.dtype
-        # TODO: do we still need to do *everything* in float32, given how we delay the division?
-        # TODO: do we need to support upcast_softmax too? SD 2.1 seems to work without it
-        if attn.upcast_attention:
-            query = query.float()
-            key_t = key_t.float()
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
 
-        bytes_per_token = torch.finfo(query.dtype).bits // 8
-        batch_x_heads, q_tokens, _ = query.shape
-        _, _, k_tokens = key_t.shape
-        qk_matmul_size_bytes = batch_x_heads * bytes_per_token * q_tokens * k_tokens
-
-        query_chunk_size = self.query_chunk_size
-        kv_chunk_size = self.kv_chunk_size
-
-        if self.chunk_threshold_bytes is not None and qk_matmul_size_bytes <= self.chunk_threshold_bytes:
-            # the big matmul fits into our memory limit; do everything in 1 chunk,
-            # i.e. send it down the unchunked fast-path
-            query_chunk_size = q_tokens
-            kv_chunk_size = k_tokens
-
-        hidden_states = attn_subquad(
-            query,
-            key_t,
-            value,
-            query_chunk_size=query_chunk_size,
-            kv_chunk_size=kv_chunk_size,
-            kv_chunk_size_min=self.kv_chunk_size_min,
-            use_checkpoint=attn.training,
+        batch_size, key_tokens, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
         )
 
-        hidden_states = hidden_states.to(dtype)
+        attention_mask = attn.prepare_attention_mask(attention_mask, key_tokens, batch_size)
+        if attention_mask is not None:
+            # expand our mask's singleton query_tokens dimension:
+            #   [batch*heads,            1, key_tokens] ->
+            #   [batch*heads, query_tokens, key_tokens]
+            # so that it can be added as a bias onto the attention scores that xformers computes:
+            #   [batch*heads, query_tokens, key_tokens]
+            # we do this explicitly because xformers doesn't broadcast the singleton dimension for us.
+            _, query_tokens, _ = hidden_states.shape
+            attention_mask = attention_mask.expand(-1, query_tokens, -1)
 
-        hidden_states = hidden_states.unflatten(0, (-1, attn.heads)).transpose(1, 2).flatten(start_dim=2)
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-        out_proj, dropout = attn.to_out
-        hidden_states = out_proj(hidden_states)
-        hidden_states = dropout(hidden_states)
+        query = attn.to_q(hidden_states, *args)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states, *args)
+        value = attn.to_v(encoder_hidden_states, *args)
+
+        query = attn.head_to_batch_dim(query).contiguous()
+        key = attn.head_to_batch_dim(key).swapaxes(1, 2).contiguous()
+        value = attn.head_to_batch_dim(value).contiguous()
+
+        hidden_states = attn_subquad(
+            query=query,
+            key_t=key,
+            value=value,
+            query_chunk_size=self.query_chunk_size,
+            kv_chunk_size=self.kv_chunk_size,
+            kv_chunk_size_min=self.kv_chunk_size_min,
+            use_checkpoint=attn.training,
+            upcast_attention=attn.upcast_attention,
+            mask=attention_mask,
+        )
+        hidden_states = hidden_states.to(query.dtype)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states, *args)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
 
         return hidden_states
 
