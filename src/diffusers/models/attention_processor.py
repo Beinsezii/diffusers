@@ -2491,7 +2491,7 @@ class SubQuadraticCrossAttnProcessor:
             query_chunk_size=self.query_chunk_size,
             kv_chunk_size=self.kv_chunk_size,
             kv_chunk_size_min=self.kv_chunk_size_min,
-            use_checkpoint=attn.training,
+            use_checkpoint=False,
             upcast_attention=attn.upcast_attention,
             mask=attention_mask,
         )
